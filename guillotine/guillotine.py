@@ -40,14 +40,35 @@ def test_transforms(examples):
     return examples
 
 
+def get_dsprites_dataset():
+    dataset = datasets.load_dataset("eurecom-ds/dsprites").remove_columns(
+        [
+            "label_orientation",
+            "label_scale",
+            "label_shape",
+            "label_x_position",
+            "label_y_position",
+        ]
+    )
+    dataset = dataset["train"].train_test_split(test_size=0.5)
+    for target in TARGETS["dsprite"]:
+        mean = dataset["train"].with_format("pandas")[target].mean()
+        std = dataset["train"].with_format("pandas")[target].std()
+        dataset["train"] = dataset["train"].map(lambda row:{target: (row[target] - mean)/(1e-5+std)}, batched=True, batch_size=2048)
+        dataset["test"] = dataset["test"].map(lambda row:{target: (row[target] - mean)/(1e-5+std)}, batched=True, batch_size=2048)
+    dataset["train"] = dataset["train"].with_transform(train_transforms)
+    dataset["test"] = dataset["test"].with_transform(test_transforms)
+    return dataset
+
 class MyModel(pl.LightningModule):
-    def __init__(self, target: str, guillotine: bool = False):
+    def __init__(self, target: str, guillotine: bool = False, dataset=None):
         """
         target: (str) the name of the dataset target to use to train the backbone
         guillotine: (bool) whether to add a projector and use guillotine (or not)
         """
         super().__init__()
         self.target = target
+        self.dataset = dataset
         self.fc = nn.Sequential(
             nn.Conv2d(3, 32, kernel_size=5, bias=False),
             nn.BatchNorm2d(32),
@@ -72,49 +93,16 @@ class MyModel(pl.LightningModule):
             )
         else:
             self.projector = nn.Identity()
-        self.sup_probe = nn.Sequential(nn.Linear(4*4*128, 1))
+        self.sup_probe = nn.Sequential(nn.Dropout1d(0.2), nn.Linear(4*4*128, 1))
         self.probe = nn.Linear(4*4*128, 5)
         self.criterion = MSELoss(reduction="none")
-        self._datasets = self.get_dsprites_datasets()
 
     def forward(self, inputs_id):
         outputs = self.fc(inputs_id)
         preds = self.probe(outputs.detach())
         return self.sup_probe(self.projector(outputs)), preds
 
-    @staticmethod
-    def get_dsprites_datasets():
-        dataset = datasets.load_dataset("eurecom-ds/dsprites").remove_columns(
-            [
-                "label_orientation",
-                "label_scale",
-                "label_shape",
-                "label_x_position",
-                "label_y_position",
-            ]
-        )
-        dataset = dataset["train"].train_test_split(test_size=0.5)
-        for target in TARGETS["dsprite"]:
-            mean = dataset["train"].with_format("pandas")[target].mean()
-            std = dataset["train"].with_format("pandas")[target].std()
-            dataset["train"] = dataset["train"].map(lambda row:{target: (row[target] - mean)/(1e-5+std)}, batched=True, batch_size=2048)
-            dataset["test"] = dataset["test"].map(lambda row:{target: (row[target] - mean)/(1e-5+std)}, batched=True, batch_size=2048)
-        dataset["train"] = dataset["train"].with_transform(train_transforms)
-        dataset["test"] = dataset["test"].with_transform(test_transforms)
-        return dataset
 
-    def train_dataloader(self):
-        return DataLoader(
-            self._datasets["train"],
-            shuffle=True,
-            drop_last=True,
-            batch_size=256,
-            num_workers=10,
-            persistent_workers=True,
-        )
-
-    def val_dataloader(self):
-        return DataLoader(self._datasets["test"], batch_size=512, num_workers=10)
 
     def get_losses(self, batch):
         input_ids = batch["image"]
@@ -150,18 +138,33 @@ class MyModel(pl.LightningModule):
     def optimizer_zero_grad(self, epoch, batch_idx, optimizer):
         optimizer.zero_grad(set_to_none=True)
 
+    def train_dataloader(self):
+        return DataLoader(
+                    self.dataset["train"],
+                    shuffle=True,
+                    drop_last=True,
+                    batch_size=256,
+                    num_workers=10,
+                    persistent_workers=True,
+                )
+
+    def val_dataloader(self):
+        return DataLoader(dataset["test"], batch_size=512, num_workers=10)
+
 
 if __name__ == "__main__":
+    dataset = get_dsprites_dataset()
+
     for guillotine in [False, True]:
         train_results = []
         test_results = []
         for target in TARGETS["dsprite"]:
-            model = MyModel(target=target, guillotine=guillotine)
+            model = MyModel(target=target, guillotine=guillotine, dataset=dataset)
             model = torch.compile(model)
             train_logger = CSVLogger(save_dir="lightning_logs", name="train")
             val_logger = CSVLogger(save_dir="lightning_logs", name="val")
             trainer = pl.Trainer(
-                max_epochs=1,
+                max_epochs=5,
                 accelerator="gpu",
                 devices=1,
                 precision="16-mixed",
@@ -170,9 +173,11 @@ if __name__ == "__main__":
             )
             trainer.fit(model)
             train_metrics = pd.read_csv(Path(train_logger.log_dir) / "metrics.csv")
+            print(train_metrics.shape)
             train_metrics = train_metrics.set_index("step").groupby("epoch").mean()
             train_results.append(train_metrics.iloc[[-1]])
             val_metrics = pd.read_csv(Path(val_logger.log_dir) / "metrics.csv")
+            print(val_metrics.shape)
             val_metrics = val_metrics.set_index("step").groupby("epoch").mean()
             test_results.append(val_metrics.iloc[[-1]])
 
