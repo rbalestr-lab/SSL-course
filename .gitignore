@@ -3,7 +3,9 @@ lightning_logs/
 __pycache__/
 *.py[cod]
 *$py.class
-
+*.gz
+cifar-10-batches-py/
+cifar-100-batches-py/
 # C extensions
 *.so
 
